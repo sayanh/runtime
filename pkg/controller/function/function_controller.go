@@ -18,10 +18,10 @@ package function
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 
 	servingv1alpha1 "github.com/knative/serving/pkg/apis/serving/v1alpha1"
-
 	runtimev1alpha1 "github.com/kyma-incubator/runtime/pkg/apis/runtime/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -146,8 +146,9 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 
 	// Service.serving.knative.dev
 
-	deployService := &servingv1alpha1.Service{}
+	// deployService := &servingv1alpha1.Service{}
 	foundService := &servingv1alpha1.Service{}
+	fmt.Printf("%v", foundService)
 
 	return reconcile.Result{}, nil
 
