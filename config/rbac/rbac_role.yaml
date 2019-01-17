@@ -7,7 +7,7 @@ rules:
 - apiGroups:
   - apps
   resources:
-  - deployments
+  - configmap
   verbs:
   - get
   - list
@@ -16,14 +16,6 @@ rules:
   - update
   - patch
   - delete
-- apiGroups:
-  - apps
-  resources:
-  - deployments/status
-  verbs:
-  - get
-  - update
-  - patch
 - apiGroups:
   - runtime.kyma-project.io
   resources:
@@ -57,27 +49,27 @@ rules:
   - update
   - patch
   - delete
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
-  - ""
-  resources:
-  - services
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
+# - apiGroups:
+#   - ""
+#   resources:
+#   - secrets
+#   verbs:
+#   - get
+#   - list
+#   - watch
+#   - create
+#   - update
+#   - patch
+#   - delete
+# - apiGroups:
+#   - ""
+#   resources:
+#   - services
+#   verbs:
+#   - get
+#   - list
+#   - watch
+#   - create
+#   - update
+#   - patch
+#   - delete

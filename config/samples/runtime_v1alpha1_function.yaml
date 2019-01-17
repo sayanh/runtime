@@ -2,6 +2,8 @@ apiVersion: runtime.kyma-project.io/v1alpha1
 kind: Function
 metadata:
   name: sample
+  labels:
+    foo: bar
 spec:
   function: |
     module.exports = {
