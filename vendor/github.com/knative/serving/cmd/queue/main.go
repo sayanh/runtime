@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -25,22 +26,25 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/knative/pkg/logging/logkey"
+	"github.com/knative/pkg/signals"
+	"github.com/knative/pkg/websocket"
 	"github.com/knative/serving/cmd/util"
 	activatorutil "github.com/knative/serving/pkg/activator/util"
+	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	"github.com/knative/serving/pkg/autoscaler"
 	"github.com/knative/serving/pkg/http/h2c"
 	"github.com/knative/serving/pkg/logging"
 	"github.com/knative/serving/pkg/queue"
 	"github.com/knative/serving/pkg/system"
-	"github.com/knative/serving/pkg/websocket"
+	"go.opencensus.io/exporter/prometheus"
+	"go.opencensus.io/stats/view"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -50,64 +54,86 @@ const (
 	statReportingQueueLength = 10
 	// Add enough buffer to not block request serving on stats collection
 	requestCountingQueueLength = 100
-	// Number of seconds the /quitquitquit handler should wait before
-	// returning.  The purpose is to keep the container alive a little
-	// bit longer, that it doesn't go away until the pod is truly
-	// removed from service.
-	quitSleepSecs = 20
+	// Duration the /quitquitquit handler should wait before returning.
+	// This is to give Istio a little bit more time to remove the pod
+	// from its configuration and propagate that to all istio-proxies
+	// in the mesh.
+	quitSleepDuration = 20 * time.Second
 )
 
 var (
-	podName               string
-	servingNamespace      string
-	servingRevision       string
-	servingRevisionKey    string
-	servingAutoscaler     string
-	servingAutoscalerPort string
-	statChan              = make(chan *autoscaler.Stat, statReportingQueueLength)
-	reqChan               = make(chan queue.ReqEvent, requestCountingQueueLength)
-	statSink              *websocket.ManagedConnection
-	logger                *zap.SugaredLogger
-	breaker               *queue.Breaker
+	podName                string
+	servingConfig          string
+	servingNamespace       string
+	servingRevision        string
+	servingRevisionKey     string
+	servingAutoscaler      string
+	servingAutoscalerPort  int
+	userTargetPort         int
+	containerConcurrency   int
+	revisionTimeoutSeconds int
+	statChan               = make(chan *autoscaler.Stat, statReportingQueueLength)
+	reqChan                = make(chan queue.ReqEvent, requestCountingQueueLength)
+	statSink               *websocket.ManagedConnection
+	logger                 *zap.SugaredLogger
+	breaker                *queue.Breaker
 
 	h2cProxy  *httputil.ReverseProxy
 	httpProxy *httputil.ReverseProxy
 
-	health *healthServer = &healthServer{alive: true}
-
-	containerConcurrency = flag.Int("containerConcurrency", 0, "")
+	server   *http.Server
+	health   *healthServer
+	reporter *queue.Reporter // Prometheus stats reporter.
 )
 
 func initEnv() {
 	podName = util.GetRequiredEnvOrFatal("SERVING_POD", logger)
+	servingConfig = util.GetRequiredEnvOrFatal("SERVING_CONFIGURATION", logger)
 	servingNamespace = util.GetRequiredEnvOrFatal("SERVING_NAMESPACE", logger)
 	servingRevision = util.GetRequiredEnvOrFatal("SERVING_REVISION", logger)
 	servingAutoscaler = util.GetRequiredEnvOrFatal("SERVING_AUTOSCALER", logger)
-	servingAutoscalerPort = util.GetRequiredEnvOrFatal("SERVING_AUTOSCALER_PORT", logger)
+	servingAutoscalerPort = util.MustParseIntEnvOrFatal("SERVING_AUTOSCALER_PORT", logger)
+	containerConcurrency = util.MustParseIntEnvOrFatal("CONTAINER_CONCURRENCY", logger)
+	revisionTimeoutSeconds = util.MustParseIntEnvOrFatal("REVISION_TIMEOUT_SECONDS", logger)
+	userTargetPort = util.MustParseIntEnvOrFatal("USER_PORT", logger)
 
 	// TODO(mattmoor): Move this key to be in terms of the KPA.
-	servingRevisionKey = autoscaler.NewKpaKey(servingNamespace, servingRevision)
+	servingRevisionKey = autoscaler.NewMetricKey(servingNamespace, servingRevision)
+	health = &healthServer{alive: true}
+	_reporter, err := queue.NewStatsReporter(servingNamespace, servingConfig, servingRevision, podName)
+	if err != nil {
+		logger.Fatal("Failed to create stats reporter", zap.Error(err))
+	}
+	reporter = _reporter
 }
 
 func statReporter() {
 	for {
 		s := <-statChan
-		if statSink == nil {
-			logger.Warn("Stat sink not (yet) connected.")
-			continue
-		}
-		if !health.isAlive() {
-			s.LameDuck = true
-		}
-		sm := autoscaler.StatMessage{
-			Stat: *s,
-			Key:  servingRevisionKey,
-		}
-		err := statSink.Send(sm)
-		if err != nil {
+		if err := sendStat(s); err != nil {
 			logger.Error("Error while sending stat", zap.Error(err))
 		}
 	}
+}
+
+// sendStat sends a single StatMessage to the autoscaler.
+func sendStat(s *autoscaler.Stat) error {
+	if statSink == nil {
+		return fmt.Errorf("stat sink not (yet) connected")
+	}
+	if !health.isAlive() {
+		s.LameDuck = true
+	}
+	reporter.Report(
+		s.LameDuck,
+		float64(s.RequestCount),
+		float64(s.AverageConcurrentRequests),
+	)
+	sm := autoscaler.StatMessage{
+		Stat: *s,
+		Key:  servingRevisionKey,
+	}
+	return statSink.Send(sm)
 }
 
 func proxyForRequest(req *http.Request) *httputil.ReverseProxy {
@@ -183,24 +209,38 @@ func (h *healthServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// quitHandler() is used for preStop hook of queue-proxy. It:
-// - marks the service as not ready, so that requests will no longer
-//   be routed to it,
-// - adds a small delay, so that the container doesn't get killed at
-//   the same time the pod is marked for removal.
+// quitHandler() is used for preStop hook of queue-proxy. It shuts down its main
+// server and blocks until it gets successfully shut down.
+// This endpoint is also called by the user-container to block its shutdown until
+// the queue-proxy's proxy server is shutdown successfully.
 func (h *healthServer) quitHandler(w http.ResponseWriter, r *http.Request) {
-	// First, we want to mark the container as not ready, so that even
-	// if the pod removal (from service) isn't yet effective, the
-	// readinessCheck will still prevent traffic to be routed to this
-	// pod.
+	// First mark the server as unhealthy to cause lameduck metrics being sent
 	h.kill()
-	// However, since both readinessCheck and pod removal from service
-	// is eventually consistent, we add here a small delay to have the
-	// container stay alive a little bit longer after.  We still have
-	// no guarantee that container termination is done only after
-	// removal from service is effective, but this has been showed to
-	// alleviate the issue.
-	time.Sleep(quitSleepSecs * time.Second)
+
+	// Force send one (empty) metric to mark the pod as a lameduck before shutting
+	// it down.
+	now := time.Now()
+	s := &autoscaler.Stat{
+		Time:     &now,
+		PodName:  podName,
+		LameDuck: true,
+	}
+	if err := sendStat(s); err != nil {
+		logger.Error("Error while sending stat", zap.Error(err))
+	}
+
+	time.Sleep(quitSleepDuration)
+
+	// Shutdown the server.
+	currentServer := server
+	if currentServer != nil {
+		if err := currentServer.Shutdown(context.Background()); err != nil {
+			logger.Error("Failed to shutdown proxy-server", zap.Error(err))
+		} else {
+			logger.Debug("Proxy server shutdown successfully.")
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, "alive: false")
 }
@@ -211,7 +251,6 @@ func setupAdminHandlers(server *http.Server) {
 	mux.HandleFunc(fmt.Sprintf("/%s", queue.RequestQueueHealthPath), health.healthHandler)
 	mux.HandleFunc(fmt.Sprintf("/%s", queue.RequestQueueQuitPath), health.quitHandler)
 	server.Handler = mux
-	server.ListenAndServe()
 }
 
 func main() {
@@ -225,7 +264,7 @@ func main() {
 		zap.String(logkey.Key, servingRevisionKey),
 		zap.String(logkey.Pod, podName))
 
-	target, err := url.Parse("http://localhost:8080")
+	target, err := url.Parse(fmt.Sprintf("http://localhost:%d", userTargetPort))
 	if err != nil {
 		logger.Fatal("Failed to parse localhost url", zap.Error(err))
 	}
@@ -238,19 +277,32 @@ func main() {
 	activatorutil.SetupHeaderPruning(h2cProxy)
 
 	// If containerConcurrency == 0 then concurrency is unlimited.
-	if *containerConcurrency > 0 {
+	if containerConcurrency > 0 {
 		// We set the queue depth to be equal to the container concurrency but at least 10 to
 		// allow the autoscaler to get a strong enough signal.
-		queueDepth := *containerConcurrency
+		queueDepth := containerConcurrency
 		if queueDepth < 10 {
 			queueDepth = 10
 		}
-		breaker = queue.NewBreaker(int32(queueDepth), int32(*containerConcurrency))
-		logger.Infof("Queue container is starting with queueDepth: %d, containerConcurrency: %d", queueDepth, *containerConcurrency)
+		breaker = queue.NewBreaker(int32(queueDepth), int32(containerConcurrency), int32(containerConcurrency))
+		logger.Infof("Queue container is starting with queueDepth: %d, containerConcurrency: %d", queueDepth, containerConcurrency)
 	}
 
+	logger.Info("Initializing OpenCensus Prometheus exporter.")
+	promExporter, err := prometheus.NewExporter(prometheus.Options{Namespace: "queue"})
+	if err != nil {
+		logger.Fatal("Failed to create the Prometheus exporter", zap.Error(err))
+	}
+	view.RegisterExporter(promExporter)
+	view.SetReportingPeriod(queue.ReportingPeriod)
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promExporter)
+		http.ListenAndServe(fmt.Sprintf(":%d", v1alpha1.RequestQueueMetricsPort), mux)
+	}()
+
 	// Open a websocket connection to the autoscaler
-	autoscalerEndpoint := fmt.Sprintf("ws://%s.%s:%s", servingAutoscaler, system.Namespace, servingAutoscalerPort)
+	autoscalerEndpoint := fmt.Sprintf("ws://%s.%s:%d", servingAutoscaler, system.Namespace, servingAutoscalerPort)
 	logger.Infof("Connecting to autoscaler at %s", autoscalerEndpoint)
 	statSink = websocket.NewDurableSendingConnection(autoscalerEndpoint)
 	go statReporter()
@@ -263,34 +315,48 @@ func main() {
 	}, time.Now())
 
 	adminServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", queue.RequestQueueAdminPort),
+		Addr:    fmt.Sprintf(":%d", v1alpha1.RequestQueueAdminPort),
 		Handler: nil,
 	}
-
-	server := h2c.NewServer(
-		fmt.Sprintf(":%d", queue.RequestQueuePort),
-		http.HandlerFunc(handler),
-	)
-
-	// Add a SIGTERM handler to gracefully shutdown the servers during
-	// pod termination.
-	sigTermChan := make(chan os.Signal)
-	signal.Notify(sigTermChan, syscall.SIGTERM)
-	go func() {
-		<-sigTermChan
-		// Calling server.Shutdown() allows pending requests to
-		// complete, while no new work is accepted.
-
-		server.Shutdown(context.Background())
-		adminServer.Shutdown(context.Background())
-
-		if statSink != nil {
-			statSink.Close()
-		}
-
-		os.Exit(0)
-	}()
-
-	go server.ListenAndServe()
 	setupAdminHandlers(adminServer)
+
+	server = h2c.NewServer(
+		fmt.Sprintf(":%d", v1alpha1.RequestQueuePort),
+		queue.TimeToFirstByteTimeoutHandler(http.HandlerFunc(handler), time.Duration(revisionTimeoutSeconds)*time.Second, "request timeout"))
+
+	// An `ErrServerClosed` should not trigger an early exit of
+	// the errgroup below.
+	catchServerError := func(runner func() error) func() error {
+		return func() error {
+			err := runner()
+			if err != http.ErrServerClosed {
+				return err
+			}
+			return nil
+		}
+	}
+
+	var g errgroup.Group
+	g.Go(catchServerError(server.ListenAndServe))
+	g.Go(catchServerError(adminServer.ListenAndServe))
+	g.Go(func() error {
+		<-signals.SetupSignalHandler()
+		return errors.New("Received SIGTERM")
+	})
+
+	if err := g.Wait(); err != nil {
+		logger.Error("Shutting down", zap.Error(err))
+	}
+
+	// Calling server.Shutdown() allows pending requests to
+	// complete, while no new work is accepted.
+	if err := adminServer.Shutdown(context.Background()); err != nil {
+		logger.Error("Failed to shutdown admin-server", zap.Error(err))
+	}
+
+	if statSink != nil {
+		if err := statSink.Close(); err != nil {
+			logger.Error("Failed to shutdown websocket connection", zap.Error(err))
+		}
+	}
 }

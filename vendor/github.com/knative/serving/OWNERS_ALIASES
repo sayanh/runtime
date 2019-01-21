@@ -8,13 +8,16 @@ aliases:
   - tcnghia
   - jonjohnsonjr
   - dprotaso
+  - dgerd
 
   autoscaling-approvers:
   - josephburnett
   - mdemirhan
+  - markusthoemmes
   autoscaling-reviewers:
   - josephburnett
   - mdemirhan
+  - markusthoemmes
 
   monitoring-approvers:
   - mdemirhan
@@ -25,11 +28,15 @@ aliases:
 
   productivity-approvers:
   - adrcunha
+  - dushyanthsc
+  - ericklawitter
   - jessiezcc
   - srinivashegde86
   - steuhs
   productivity-reviewers:
   - adrcunha
+  - dushyanthsc
+  - ericklawitter
   - jessiezcc
   - srinivashegde86
   - steuhs

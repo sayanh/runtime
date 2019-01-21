@@ -40,19 +40,17 @@ type revisionActivator struct {
 	kubeClient  kubernetes.Interface
 	knaClient   clientset.Interface
 	logger      *zap.SugaredLogger
-	reporter    StatsReporter
 }
 
 // NewRevisionActivator creates an Activator that changes revision
 // serving status to active if necessary, then returns the endpoint
 // once the revision is ready to serve traffic.
-func NewRevisionActivator(kubeClient kubernetes.Interface, servingClient clientset.Interface, logger *zap.SugaredLogger, reporter StatsReporter) Activator {
+func NewRevisionActivator(kubeClient kubernetes.Interface, servingClient clientset.Interface, logger *zap.SugaredLogger) Activator {
 	return &revisionActivator{
 		readyTimout: 60 * time.Second,
 		kubeClient:  kubeClient,
 		knaClient:   servingClient,
 		logger:      logger,
-		reporter:    reporter,
 	}
 }
 
@@ -75,11 +73,8 @@ func (r *revisionActivator) activateRevision(namespace, name string) (*v1alpha1.
 		return nil, errors.Wrap(err, "Unable to get revision")
 	}
 
-	serviceName, configurationName := getServiceAndConfigurationLabels(revision)
-	r.reporter.ReportRequest(namespace, serviceName, configurationName, name, 1.0)
-
-	// Wait for the revision to be ready
-	if !revision.Status.IsReady() {
+	// Wait for the revision to not require activation.
+	if revision.Status.IsActivationRequired() {
 		wi, err := r.knaClient.ServingV1alpha1().Revisions(rev.namespace).Watch(metav1.ListOptions{
 			FieldSelector: fmt.Sprintf("metadata.name=%s", rev.name),
 		})
@@ -88,24 +83,24 @@ func (r *revisionActivator) activateRevision(namespace, name string) (*v1alpha1.
 		}
 		defer wi.Stop()
 		ch := wi.ResultChan()
-	RevisionReady:
+	RevisionActive:
 		for {
 			select {
 			case <-time.After(r.readyTimout):
 				// last chance to check
-				if revision.Status.IsReady() {
-					break RevisionReady
+				if !revision.Status.IsActivationRequired() {
+					break RevisionActive
 				}
 				return nil, errors.New("Timeout waiting for revision to become ready")
 			case event := <-ch:
 				if revision, ok := event.Object.(*v1alpha1.Revision); ok {
-					if !revision.Status.IsReady() {
+					if revision.Status.IsActivationRequired() {
 						logger.Info("Revision is not yet ready")
 						continue
 					} else {
 						logger.Info("Revision is ready")
 					}
-					break RevisionReady
+					break RevisionActive
 				} else {
 					return nil, fmt.Errorf("Unexpected result type for revision: %v", event)
 				}

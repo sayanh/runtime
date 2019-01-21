@@ -131,6 +131,13 @@
   version = "v0.2.0"
 
 [[projects]]
+  digest = "1:32e614b7003477995c60b7cd48b8ffae2e00d3ba7bc3e813e83c033382493578"
+  name = "github.com/google/go-containerregistry"
+  packages = ["pkg/name"]
+  pruneopts = "T"
+  revision = "5f7b0e4895413d785ff15b84d218d73e8a47866a"
+
+[[projects]]
   branch = "master"
   digest = "1:3ee90c0d94da31b442dde97c99635aaafec68d0b8a3c12ee2075c6bdabeec6bb"
   name = "github.com/google/gofuzz"
@@ -252,7 +259,7 @@
   revision = "d3a9e54be7d4213b4018135d82b586de45f6a694"
 
 [[projects]]
-  digest = "1:9fbbb44fbb4a76b60c198d44f07df00dc52400946f2d7dfadb44d7f918ee5e94"
+  digest = "1:9fac383b917987738b3bc69636de39d2f12343ccaa7da2b5cb4aa8be95637a1e"
   name = "github.com/knative/serving"
   packages = [
     "pkg/apis/autoscaling",
@@ -262,8 +269,8 @@
     "pkg/apis/serving/v1alpha1",
   ]
   pruneopts = "T"
-  revision = "5cbee406446031df3105ca2ac90ce4e9369207dd"
-  version = "v0.2.3"
+  revision = "4d198db8756db2f8a3c228302a97fb3a216a9475"
+  version = "v0.3.0"
 
 [[projects]]
   digest = "1:3804a3a02964db8e6db3e5e7960ac1c1a9b12835642dd4f4ac4e56c749ec73eb"
@@ -916,9 +923,11 @@
   analyzer-version = 1
   input-imports = [
     "github.com/emicklei/go-restful",
+    "github.com/knative/build/pkg/apis/build/v1alpha1",
     "github.com/knative/serving/pkg/apis/serving/v1alpha1",
     "github.com/onsi/ginkgo",
     "github.com/onsi/gomega",
+    "github.com/pborman/uuid",
     "golang.org/x/net/context",
     "k8s.io/api/apps/v1",
     "k8s.io/api/core/v1",

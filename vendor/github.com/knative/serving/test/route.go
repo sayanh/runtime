@@ -32,11 +32,10 @@ import (
 )
 
 // CreateRoute creates a route in the given namespace using the route name in names
-func CreateRoute(logger *logging.BaseLogger, clients *Clients, names ResourceNames) error {
+func CreateRoute(logger *logging.BaseLogger, clients *Clients, names ResourceNames) (*v1alpha1.Route, error) {
 	route := Route(ServingNamespace, names)
 	LogResourceObject(logger, ResourceObjects{Route: route})
-	_, err := clients.ServingClient.Routes.Create(route)
-	return err
+	return clients.ServingClient.Routes.Create(route)
 }
 
 // CreateBlueGreenRoute creates a route in the given namespace using the route name in names.
@@ -55,30 +54,13 @@ func UpdateBlueGreenRoute(logger *logging.BaseLogger, clients *Clients, names, b
 		return nil, err
 	}
 	newRoute := BlueGreenRoute(ServingNamespace, names, blue, green)
-	newRoute.ObjectMeta.ResourceVersion = route.ObjectMeta.ResourceVersion
+	newRoute.ObjectMeta = route.ObjectMeta
 	LogResourceObject(logger, ResourceObjects{Route: newRoute})
 	patchBytes, err := createPatch(route, newRoute)
 	if err != nil {
 		return nil, err
 	}
 	return clients.ServingClient.Routes.Patch(names.Route, types.JSONPatchType, patchBytes, "")
-}
-
-// ProbeDomain sends requests to a domain until we get a successful
-// response. This ensures the domain is routable before we send it a
-// bunch of traffic.
-func ProbeDomain(logger *logging.BaseLogger, clients *Clients, domain string) error {
-	client, err := pkgTest.NewSpoofingClient(clients.KubeClient, logger, domain, ServingFlags.ResolvableDomain)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s", domain), nil)
-	if err != nil {
-		return err
-	}
-	// TODO(tcnghia): Replace this probing with Status check when we have them.
-	_, err = client.Poll(req, pkgTest.Retrying(pkgTest.MatchesAny, http.StatusNotFound, http.StatusServiceUnavailable))
-	return err
 }
 
 // RunRouteProber creates and runs a prober as background goroutine to keep polling Route.

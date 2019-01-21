@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"reflect"
 
+	buildv1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	servingv1alpha1 "github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	runtimev1alpha1 "github.com/kyma-incubator/runtime/pkg/apis/runtime/v1alpha1"
+	"github.com/pborman/uuid"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -111,6 +113,7 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 	data["handler.js"] = fn.Spec.Function
 	data["package.json"] = fn.Spec.Deps
 
+	// Managing a ConfigMap
 	deployCm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:    fn.Labels,
@@ -125,6 +128,7 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 
 	foundCm := &corev1.ConfigMap{}
 	err = r.Get(context.TODO(), types.NamespacedName{Name: deployCm.Name, Namespace: deployCm.Namespace}, foundCm)
+
 	if err != nil && errors.IsNotFound(err) {
 		log.Info("Creating ConfigMap", "namespace", deployCm.Namespace, "name", deployCm.Name)
 		err = r.Create(context.TODO(), deployCm)
@@ -132,6 +136,10 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 			return reconcile.Result{}, err
 		}
 	} else if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := controllerutil.SetControllerReference(fn, deployCm, r.scheme); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -144,64 +152,166 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 		}
 	}
 
-	// Service.serving.knative.dev
+	// Managing a resource of type Service.serving.knative.dev
 
-	// deployService := &servingv1alpha1.Service{}
+	dockerHubAccount := "shazra"
+	dockerRegistry := ""
+	randomStr := uuid.NewRandom().String()
+	imageName := ""
+	if len(dockerRegistry) == 0 {
+		imageName = fmt.Sprintf("%s/%s-%s", dockerHubAccount, fn.Name, randomStr)
+	} else {
+		imageName = fmt.Sprintf("%s/%s-%s", dockerRegistry, fn.Name, randomStr)
+	}
+
+	deployService := &servingv1alpha1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:    fn.Labels,
+			Namespace: fn.Namespace,
+			Name:      fn.Name,
+		},
+		Spec: getServiceSpec(imageName),
+	}
+
+	if err := controllerutil.SetControllerReference(fn, deployCm, r.scheme); err != nil {
+		return reconcile.Result{}, err
+	}
+
 	foundService := &servingv1alpha1.Service{}
-	fmt.Printf("%v", foundService)
+	err = r.Get(context.TODO(), types.NamespacedName{Name: deployService.Name, Namespace: deployService.Namespace}, foundService)
+
+	if err != nil && errors.IsNotFound(err) {
+		log.Info("Creating Service", "namespace", deployService.Namespace, "name", deployService.Name)
+		err = r.Create(context.TODO(), deployService)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+	} else if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := controllerutil.SetControllerReference(fn, deployService, r.scheme); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if !reflect.DeepEqual(deployService.Spec, deployService.Spec) {
+		foundService.Spec = deployService.Spec
+		log.Info("Updating Service", "namespace", deployService.Namespace, "name", deployService.Name)
+		err = r.Update(context.TODO(), foundService)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	// TODO make all these configurable
+	// 1. programming language
+	// 2. configmap for secrets
 
 	return reconcile.Result{}, nil
 
-	// deploy := &appsv1.Deployment{
-	// 	ObjectMeta: metav1.ObjectMeta{
-	// 		Name:      fn.Name + "-deployment",
-	// 		Namespace: fn.Namespace,
-	// 		Labels:    fn.Labels,
-	// 	},
-	// 	Spec: appsv1.DeploymentSpec{
-	// 		Selector: &metav1.LabelSelector{
-	// 			MatchLabels: map[string]string{"deployment": fn.Name + "-deployment"},
-	// 		},
-	// 		Template: corev1.PodTemplateSpec{
-	// 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"deployment": fn.Name + "-deployment"}},
-	// 			Spec: corev1.PodSpec{
-	// 				Containers: []corev1.Container{
-	// 					{
-	// 						Name:  "nginx",
-	// 						Image: "nginx",
-	// 					},
-	// 				},
-	// 			},
-	// 		},
-	// 	},
-	// }
-	// if err := controllerutil.SetControllerReference(fn, deploy, r.scheme); err != nil {
-	// 	return reconcile.Result{}, err
-	// }
+}
 
-	// // TODO(user): Change this for the object type created by your controller
-	// // Check if the Deployment already exists
-	// found := &appsv1.Deployment{}
-	// err = r.Get(context.TODO(), types.NamespacedName{Name: deploy.Name, Namespace: deploy.Namespace}, found)
-	// if err != nil && errors.IsNotFound(err) {
-	// 	log.Info("Creating Deployment", "namespace", deploy.Namespace, "name", deploy.Name)
-	// 	err = r.Create(context.TODO(), deploy)
-	// 	if err != nil {
-	// 		return reconcile.Result{}, err
-	// 	}
-	// } else if err != nil {
-	// 	return reconcile.Result{}, err
-	// }
+func getServiceSpec(imageName string) servingv1alpha1.ServiceSpec {
+	defaultMode := int32(420)
+	buildContainer := getBuildContainer(imageName)
+	volumes := []corev1.Volume{
+		{
+			Name: "dockerfile-vol",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					DefaultMode: &defaultMode,
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: "dockerfile-vol",
+					},
+				},
+			},
+		},
+		{
+			Name: "deps-vol",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					DefaultMode: &defaultMode,
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: "deps-vol",
+					},
+				},
+			},
+		},
+	}
+	// TODO: Make it constant for nodejs8/nodejs6
+	envVarsForRevision := []corev1.EnvVar{
+		{
+			Name:  "FUNC_HANDLER",
+			Value: "main",
+		},
+		{
+			Name:  "MOD_NAME",
+			Value: "handler",
+		},
+		{
+			Name:  "FUNC_TIMEOUT",
+			Value: "180",
+		},
+		{
+			Name:  "FUNC_RUNTIME",
+			Value: "nodejs8",
+		},
+		{
+			Name:  "FUNC_MEMORY_LIMIT",
+			Value: "128Mi",
+		},
+		{
+			Name:  "FUNC_PORT",
+			Value: "8080",
+		},
+		{
+			Name:  "NODE_PATH",
+			Value: "$(KUBELESS_INSTALL_VOLUME)/node_modules",
+		},
+	}
 
-	// // TODO(user): Change this for the object type created by your controller
-	// // Update the found object and write the result back if there are any changes
-	// if !reflect.DeepEqual(deploy.Spec, found.Spec) {
-	// 	found.Spec = deploy.Spec
-	// 	log.Info("Updating Deployment", "namespace", deploy.Namespace, "name", deploy.Name)
-	// 	err = r.Update(context.TODO(), found)
-	// 	if err != nil {
-	// 		return reconcile.Result{}, err
-	// 	}
-	// }
-	// return reconcile.Result{}, nil
+	return servingv1alpha1.ServiceSpec{
+		RunLatest: &servingv1alpha1.RunLatestType{
+			Configuration: servingv1alpha1.ConfigurationSpec{
+				Build: &servingv1alpha1.RawExtension{
+					BuildSpec: &buildv1alpha1.BuildSpec{
+						ServiceAccountName: "build-bot",
+						Steps: []corev1.Container{
+							*buildContainer,
+						},
+						Volumes: volumes,
+					},
+				},
+				RevisionTemplate: servingv1alpha1.RevisionTemplateSpec{
+					Spec: servingv1alpha1.RevisionSpec{
+						Container: corev1.Container{
+							Image: imageName,
+							Env:   envVarsForRevision,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func getBuildContainer(imageName string) *corev1.Container {
+	destination := fmt.Sprintf("--destination=%s", imageName)
+	buildContainer := corev1.Container{
+		Name:    "build-and-push",
+		Image:   "gcr.io/kaniko-project/executor",
+		Command: []string{"--dockerfile=/workspace/Dockerfile", destination},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "dockerfile-vol",
+				MountPath: "/workspace",
+			},
+			{
+				Name:      "deps-vol",
+				MountPath: "/src",
+			},
+		},
+	}
+
+	return &buildContainer
 }

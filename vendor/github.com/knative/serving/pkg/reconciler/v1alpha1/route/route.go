@@ -34,7 +34,6 @@ import (
 	"github.com/knative/pkg/controller"
 	"github.com/knative/pkg/logging"
 	"github.com/knative/pkg/tracker"
-	netv1alpha1 "github.com/knative/serving/pkg/apis/networking/v1alpha1"
 	"github.com/knative/serving/pkg/apis/serving"
 	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	networkinginformers "github.com/knative/serving/pkg/client/informers/externalversions/networking/v1alpha1"
@@ -129,27 +128,31 @@ func NewControllerWithClock(
 		Handler: cache.ResourceEventHandlerFuncs{
 			AddFunc:    impl.EnqueueControllerOf,
 			UpdateFunc: controller.PassNew(impl.EnqueueControllerOf),
+			DeleteFunc: impl.EnqueueControllerOf,
 		},
 	})
 
 	clusterIngressInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
 		FilterFunc: controller.Filter(v1alpha1.SchemeGroupVersion.WithKind("Route")),
 		Handler: cache.ResourceEventHandlerFuncs{
-			AddFunc:    c.enqueueOwnerRoute(impl),
-			UpdateFunc: controller.PassNew(c.enqueueOwnerRoute(impl)),
+			AddFunc:    impl.EnqueueLabelOfNamespaceScopedResource(serving.RouteNamespaceLabelKey, serving.RouteLabelKey),
+			UpdateFunc: controller.PassNew(impl.EnqueueLabelOfNamespaceScopedResource(serving.RouteNamespaceLabelKey, serving.RouteLabelKey)),
+			DeleteFunc: impl.EnqueueLabelOfNamespaceScopedResource(serving.RouteNamespaceLabelKey, serving.RouteLabelKey),
 		},
 	})
 
 	c.tracker = tracker.New(impl.EnqueueKey, opt.GetTrackerLease())
 	gvk := v1alpha1.SchemeGroupVersion.WithKind("Configuration")
 	configInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    reconciler.EnsureTypeMeta(c.tracker.OnChanged, gvk),
-		UpdateFunc: controller.PassNew(reconciler.EnsureTypeMeta(c.tracker.OnChanged, gvk)),
+		AddFunc:    controller.EnsureTypeMeta(c.tracker.OnChanged, gvk),
+		UpdateFunc: controller.PassNew(controller.EnsureTypeMeta(c.tracker.OnChanged, gvk)),
+		DeleteFunc: controller.EnsureTypeMeta(c.tracker.OnChanged, gvk),
 	})
 	gvk = v1alpha1.SchemeGroupVersion.WithKind("Revision")
 	revisionInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    reconciler.EnsureTypeMeta(c.tracker.OnChanged, gvk),
-		UpdateFunc: controller.PassNew(reconciler.EnsureTypeMeta(c.tracker.OnChanged, gvk)),
+		AddFunc:    controller.EnsureTypeMeta(c.tracker.OnChanged, gvk),
+		UpdateFunc: controller.PassNew(controller.EnsureTypeMeta(c.tracker.OnChanged, gvk)),
+		DeleteFunc: controller.EnsureTypeMeta(c.tracker.OnChanged, gvk),
 	})
 
 	c.Logger.Info("Setting up ConfigMap receivers")
@@ -179,7 +182,7 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 
 	ctx = c.configStore.ToContext(ctx)
 
-	// Get the Route resource with this namespace/name
+	// Get the Route resource with this namespace/name.
 	original, err := c.routeLister.Routes(namespace).Get(name)
 	if apierrs.IsNotFound(err) {
 		// The resource may no longer exist, in which case we stop processing.
@@ -188,7 +191,7 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 	} else if err != nil {
 		return err
 	}
-	// Don't modify the informers copy
+	// Don't modify the informers copy.
 	route := original.DeepCopy()
 
 	// Reconcile this copy of the route and then write back any status
@@ -199,30 +202,60 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 		// This is important because the copy we loaded from the informer's
 		// cache may be stale and we don't want to overwrite a prior update
 		// to status with this stale state.
-	} else if _, err := c.updateStatus(ctx, route); err != nil {
+	} else if _, err := c.updateStatus(route); err != nil {
 		logger.Warn("Failed to update route status", zap.Error(err))
 		c.Recorder.Eventf(route, corev1.EventTypeWarning, "UpdateFailed",
-			"Failed to update status for route %q: %v", route.Name, err)
+			"Failed to update status for Route %q: %v", route.Name, err)
 		return err
 	}
 	return err
 }
 
-func (c *Reconciler) reconcile(ctx context.Context, route *v1alpha1.Route) error {
+func (c *Reconciler) reconcile(ctx context.Context, r *v1alpha1.Route) error {
 	logger := logging.FromContext(ctx)
-	route.Status.InitializeConditions()
 
-	logger.Infof("Reconciling route :%v", route)
+	// We may be reading a version of the object that was stored at an older version
+	// and may not have had all of the assumed defaults specified.  This won't result
+	// in this getting written back to the API Server, but lets downstream logic make
+	// assumptions about defaulting.
+	r.SetDefaults()
+
+	r.Status.InitializeConditions()
+
+	logger.Infof("Reconciling route: %v", r)
+	// Configure traffic based on the RouteSpec.
+	traffic, err := c.configureTraffic(ctx, r)
+	if traffic == nil || err != nil {
+		// Traffic targets aren't ready, no need to configure child resources.
+		return err
+	}
+
+	logger.Info("Updating targeted revisions.")
+	// In all cases we will add annotations to the referred targets.  This is so that when they become
+	// routable we can know (through a listener) and attempt traffic configuration again.
+	if err := c.reconcileTargetRevisions(ctx, traffic, r); err != nil {
+		return err
+	}
+
+	// Update the information that makes us Addressable.
+	r.Status.Domain = routeDomain(ctx, r)
+	r.Status.DomainInternal = resourcenames.K8sServiceFullname(r)
+	r.Status.Address = &duckv1alpha1.Addressable{
+		Hostname: resourcenames.K8sServiceFullname(r),
+	}
+
+	logger.Info("Creating ClusterIngress.")
+	clusterIngress, err := c.reconcileClusterIngress(ctx, r, resources.MakeClusterIngress(r, traffic))
+	if err != nil {
+		return err
+	}
+	r.Status.PropagateClusterIngressStatus(clusterIngress.Status)
+
 	logger.Info("Creating/Updating placeholder k8s services")
-	if err := c.reconcilePlaceholderService(ctx, route); err != nil {
+	if err := c.reconcilePlaceholderService(ctx, r, clusterIngress); err != nil {
 		return err
 	}
 
-	// Call configureTrafficAndUpdateRouteStatus, which also updates the Route.Status
-	// to contain the domain we will use for Gateway creation.
-	if _, err := c.configureTraffic(ctx, route); err != nil {
-		return err
-	}
 	logger.Info("Route successfully synced")
 	return nil
 }
@@ -233,17 +266,7 @@ func (c *Reconciler) reconcile(ctx context.Context, route *v1alpha1.Route) error
 //
 // If traffic is configured we update the RouteStatus with AllTrafficAssigned = True.  Otherwise we
 // mark AllTrafficAssigned = False, with a message referring to one of the missing target.
-//
-// In all cases we will add annotations to the referred targets.  This is so that when they become
-// routable we can know (through a listener) and attempt traffic configuration again.
-func (c *Reconciler) configureTraffic(ctx context.Context, r *v1alpha1.Route) (*v1alpha1.Route, error) {
-	// Update the information that makes us Callable.
-	r.Status.Domain = routeDomain(ctx, r)
-	r.Status.DomainInternal = resourcenames.K8sServiceFullname(r)
-	r.Status.Address = &duckv1alpha1.Addressable{
-		Hostname: resourcenames.K8sServiceFullname(r),
-	}
-
+func (c *Reconciler) configureTraffic(ctx context.Context, r *v1alpha1.Route) (*traffic.TrafficConfig, error) {
 	logger := logging.FromContext(ctx)
 	t, err := traffic.BuildTrafficConfiguration(c.configurationLister, c.revisionLister, r)
 
@@ -272,53 +295,20 @@ func (c *Reconciler) configureTraffic(ctx context.Context, r *v1alpha1.Route) (*
 		// An error that's not due to missing traffic target should
 		// make us fail fast.
 		r.Status.MarkUnknownTrafficError(err.Error())
-		return r, err
+		return nil, err
 	}
 	if badTarget != nil && isTargetError {
 		badTarget.MarkBadTrafficTarget(&r.Status)
 
 		// Traffic targets aren't ready, no need to configure Route.
-		return r, nil
-	}
-	logger.Info("All referred targets are routable.")
-
-	logger.Info("Updating targeted revisions.")
-	if err := c.reconcileTargetRevisions(ctx, t, r); err != nil {
-		return r, err
+		return nil, nil
 	}
 
-	logger.Info("Creating ClusterIngress.")
-	clusterIngress, err := c.reconcileClusterIngress(ctx, r, resources.MakeClusterIngress(r, t))
-	if err != nil {
-		return r, err
-	}
-	r.Status.PropagateClusterIngressStatus(clusterIngress.Status)
-
-	logger.Info("ClusterIngress created, marking AllTrafficAssigned with traffic information.")
+	logger.Info("All referred targets are routable, marking AllTrafficAssigned with traffic information.")
 	r.Status.Traffic = t.GetRevisionTrafficTargets()
 	r.Status.MarkTrafficAssigned()
 
-	return r, nil
-}
-
-// TODO(lichuqiang): add a generalized method in pkg repo to unify similar behaviors.
-func (c *Reconciler) enqueueOwnerRoute(impl *controller.Impl) func(obj interface{}) {
-	return func(obj interface{}) {
-		ing, ok := obj.(*netv1alpha1.ClusterIngress)
-		if !ok {
-			c.Logger.Infof("Ignoring non-ClusterIngress objects %v", obj)
-			return
-		}
-		// Check whether the ClusterIngress is referred by a Route.
-		routeName, keyExist := ing.Labels[serving.RouteLabelKey]
-		routeNamespace, nsExist := ing.Labels[serving.RouteNamespaceLabelKey]
-		if !keyExist || !nsExist {
-			c.Logger.Errorf("ClusterIngress %s does not have a referring route", ing.Name)
-			return
-		}
-
-		impl.EnqueueKey(fmt.Sprintf("%s/%s", routeNamespace, routeName))
-	}
+	return t, nil
 }
 
 /////////////////////////////////////////

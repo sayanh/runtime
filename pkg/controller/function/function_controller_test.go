@@ -23,7 +23,7 @@ import (
 	runtimev1alpha1 "github.com/kyma-incubator/runtime/pkg/apis/runtime/v1alpha1"
 	"github.com/onsi/gomega"
 	"golang.org/x/net/context"
-	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,7 +35,7 @@ import (
 var c client.Client
 
 var expectedRequest = reconcile.Request{NamespacedName: types.NamespacedName{Name: "foo", Namespace: "default"}}
-var depKey = types.NamespacedName{Name: "foo-deployment", Namespace: "default"}
+var depKey = types.NamespacedName{Name: "foo", Namespace: "default"}
 
 const timeout = time.Second * 5
 
@@ -71,17 +71,19 @@ func TestReconcile(t *testing.T) {
 	defer c.Delete(context.TODO(), instance)
 	g.Eventually(requests, timeout).Should(gomega.Receive(gomega.Equal(expectedRequest)))
 
-	deploy := &appsv1.Deployment{}
-	g.Eventually(func() error { return c.Get(context.TODO(), depKey, deploy) }, timeout).
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"},
+	}
+	g.Eventually(func() error { return c.Get(context.TODO(), depKey, cm) }, timeout).
 		Should(gomega.Succeed())
 
 	// Delete the Deployment and expect Reconcile to be called for Deployment deletion
-	g.Expect(c.Delete(context.TODO(), deploy)).NotTo(gomega.HaveOccurred())
+	g.Expect(c.Delete(context.TODO(), cm)).NotTo(gomega.HaveOccurred())
 	g.Eventually(requests, timeout).Should(gomega.Receive(gomega.Equal(expectedRequest)))
-	g.Eventually(func() error { return c.Get(context.TODO(), depKey, deploy) }, timeout).
+	g.Eventually(func() error { return c.Get(context.TODO(), depKey, cm) }, timeout).
 		Should(gomega.Succeed())
 
 	// Manually delete Deployment since GC isn't enabled in the test control plane
-	g.Expect(c.Delete(context.TODO(), deploy)).To(gomega.Succeed())
+	g.Expect(c.Delete(context.TODO(), cm)).To(gomega.Succeed())
 
 }

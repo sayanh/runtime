@@ -19,23 +19,21 @@ package main
 import (
 	"flag"
 	"log"
-	"net/http"
 	"time"
 
 	"github.com/knative/pkg/configmap"
 	"github.com/knative/pkg/signals"
-	kpa "github.com/knative/serving/pkg/apis/autoscaling/v1alpha1"
 	"github.com/knative/serving/pkg/apis/serving"
 	"github.com/knative/serving/pkg/autoscaler"
 	"github.com/knative/serving/pkg/autoscaler/statserver"
 	clientset "github.com/knative/serving/pkg/client/clientset/versioned"
 	informers "github.com/knative/serving/pkg/client/informers/externalversions"
 	"github.com/knative/serving/pkg/logging"
+	"github.com/knative/serving/pkg/metrics"
 	"github.com/knative/serving/pkg/reconciler"
-	"github.com/knative/serving/pkg/reconciler/v1alpha1/autoscaling"
+	"github.com/knative/serving/pkg/reconciler/v1alpha1/autoscaling/hpa"
+	"github.com/knative/serving/pkg/reconciler/v1alpha1/autoscaling/kpa"
 	"github.com/knative/serving/pkg/system"
-	"go.opencensus.io/exporter/prometheus"
-	"go.opencensus.io/stats/view"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -53,7 +51,7 @@ const (
 	controllerThreads = 2
 	statsServerAddr   = ":8080"
 	statsBufferLen    = 1000
-	logLevelKey       = "autoscaler"
+	component         = "autoscaler"
 )
 
 var (
@@ -74,7 +72,7 @@ func main() {
 	}
 
 	var atomicLevel zap.AtomicLevel
-	logger, atomicLevel := logging.NewLoggerFromConfig(loggingConfig, logLevelKey)
+	logger, atomicLevel := logging.NewLoggerFromConfig(loggingConfig, component)
 	defer logger.Sync()
 
 	// set up signals so we handle the first shutdown signal gracefully
@@ -92,8 +90,9 @@ func main() {
 
 	// Watch the logging config map and dynamically update logging levels.
 	configMapWatcher := configmap.NewInformedWatcher(kubeClientSet, system.Namespace)
-	configMapWatcher.Watch(logging.ConfigName, logging.UpdateLevelFromConfigMap(logger, atomicLevel, logLevelKey))
-
+	configMapWatcher.Watch(logging.ConfigName, logging.UpdateLevelFromConfigMap(logger, atomicLevel, component))
+	// Watch the observability config map and dynamically update metrics exporter.
+	configMapWatcher.Watch(metrics.ObservabilityConfigName, metrics.UpdateExporterFromConfigMap(component, logger))
 	// This is based on how Kubernetes sets up its scale client based on discovery:
 	// https://github.com/kubernetes/kubernetes/blob/94c2c6c84/cmd/kube-controller-manager/app/autoscaling.go#L75-L81
 	restMapper := buildRESTMapper(kubeClientSet, stopCh)
@@ -130,11 +129,13 @@ func main() {
 	servingInformerFactory := informers.NewSharedInformerFactory(servingClientSet, time.Second*30)
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClientSet, time.Second*30)
 
-	kpaInformer := servingInformerFactory.Autoscaling().V1alpha1().PodAutoscalers()
+	paInformer := servingInformerFactory.Autoscaling().V1alpha1().PodAutoscalers()
 	endpointsInformer := kubeInformerFactory.Core().V1().Endpoints()
+	hpaInformer := kubeInformerFactory.Autoscaling().V1().HorizontalPodAutoscalers()
 
-	kpaScaler := autoscaling.NewKPAScaler(servingClientSet, scaleClient, logger, configMapWatcher)
-	ctl := autoscaling.NewController(&opt, kpaInformer, endpointsInformer, multiScaler, kpaScaler)
+	kpaScaler := kpa.NewKPAScaler(servingClientSet, scaleClient, logger, configMapWatcher)
+	kpaCtl := kpa.NewController(&opt, paInformer, endpointsInformer, multiScaler, kpaScaler, dynConfig)
+	hpaCtl := hpa.NewController(&opt, paInformer, hpaInformer)
 
 	// Start the serving informer factory.
 	kubeInformerFactory.Start(stopCh)
@@ -146,8 +147,9 @@ func main() {
 	// Wait for the caches to be synced before starting controllers.
 	logger.Info("Waiting for informer caches to sync")
 	for i, synced := range []cache.InformerSynced{
-		kpaInformer.Informer().HasSynced,
+		paInformer.Informer().HasSynced,
 		endpointsInformer.Informer().HasSynced,
+		hpaInformer.Informer().HasSynced,
 	} {
 		if ok := cache.WaitForCacheSync(stopCh, synced); !ok {
 			logger.Fatalf("failed to wait for cache at index %v to sync", i)
@@ -156,21 +158,11 @@ func main() {
 
 	var eg errgroup.Group
 	eg.Go(func() error {
-		return ctl.Run(controllerThreads, stopCh)
+		return kpaCtl.Run(controllerThreads, stopCh)
 	})
-
-	// Setup the metrics to flow to Prometheus.
-	logger.Info("Initializing OpenCensus Prometheus exporter.")
-	promExporter, err := prometheus.NewExporter(prometheus.Options{Namespace: "autoscaler"})
-	if err != nil {
-		logger.Fatal("Failed to create the Prometheus exporter.", zap.Error(err))
-	}
-	view.RegisterExporter(promExporter)
-	view.SetReportingPeriod(time.Second * 10)
-	go func() {
-		http.Handle("/metrics", promExporter)
-		http.ListenAndServe(":9090", nil)
-	}()
+	eg.Go(func() error {
+		return hpaCtl.Run(controllerThreads, stopCh)
+	})
 
 	statsCh := make(chan *autoscaler.StatMessage, statsBufferLen)
 
@@ -218,20 +210,20 @@ func buildRESTMapper(kubeClientSet kubernetes.Interface, stopCh <-chan struct{})
 	return rm
 }
 
-func uniScalerFactory(kpa *kpa.PodAutoscaler, dynamicConfig *autoscaler.DynamicConfig) (autoscaler.UniScaler, error) {
-	// Create a stats reporter which tags statistics by KPA namespace, configuration name, and KPA name.
-	reporter, err := autoscaler.NewStatsReporter(kpa.Namespace,
-		labelValueOrEmpty(kpa, serving.ServiceLabelKey), labelValueOrEmpty(kpa, serving.ConfigurationLabelKey), kpa.Name)
+func uniScalerFactory(metric *autoscaler.Metric, dynamicConfig *autoscaler.DynamicConfig) (autoscaler.UniScaler, error) {
+	// Create a stats reporter which tags statistics by PA namespace, configuration name, and PA name.
+	reporter, err := autoscaler.NewStatsReporter(metric.Namespace,
+		labelValueOrEmpty(metric, serving.ServiceLabelKey), labelValueOrEmpty(metric, serving.ConfigurationLabelKey), metric.Name)
 	if err != nil {
 		return nil, err
 	}
 
-	return autoscaler.New(dynamicConfig, kpa.Spec.ContainerConcurrency, reporter), nil
+	return autoscaler.New(dynamicConfig, metric.Spec.TargetConcurrency, reporter), nil
 }
 
-func labelValueOrEmpty(kpa *kpa.PodAutoscaler, labelKey string) string {
-	if kpa.Labels != nil {
-		if value, ok := kpa.Labels[labelKey]; ok {
+func labelValueOrEmpty(metric *autoscaler.Metric, labelKey string) string {
+	if metric.Labels != nil {
+		if value, ok := metric.Labels[labelKey]; ok {
 			return value
 		}
 	}

@@ -28,6 +28,15 @@
 source $(dirname $0)/cluster.sh
 
 # Helper functions.
+function dump_app_logs() {
+  echo ">>> Knative Serving $1 logs:"
+  for pod in $(get_app_pods "$1" knative-serving)
+  do
+    echo ">>> Pod: $pod"
+    kubectl -n knative-serving logs "$pod" -c "$1"
+  done
+}
+
 function dump_extra_cluster_state() {
   echo ">>> Routes:"
   kubectl get routes -o yaml --all-namespaces
@@ -35,20 +44,11 @@ function dump_extra_cluster_state() {
   kubectl get configurations -o yaml --all-namespaces
   echo ">>> Revisions:"
   kubectl get revisions -o yaml --all-namespaces
-  echo ">>> Knative Serving controller log:"
-  kubectl -n knative-serving logs $(get_app_pod controller knative-serving)
-  echo ">>> Knative Serving autoscaler log:"
-  kubectl -n knative-serving logs $(get_app_pod autoscaler knative-serving)
-  echo ">>> Knative Serving activator log:"
-  kubectl -n knative-serving logs $(get_app_pod activator knative-serving)
-}
 
-function publish_test_images() {
-  echo ">> Publishing test images"
-  image_dirs="$(find ${REPO_ROOT_DIR}/test/test_images -mindepth 1 -maxdepth 1 -type d)"
-  for image_dir in ${image_dirs}; do
-    ko publish -P "github.com/knative/serving/test/test_images/$(basename ${image_dir})"
-  done
+  dump_app_logs controller
+  dump_app_logs webhook
+  dump_app_logs autoscaler
+  dump_app_logs activator
 }
 
 # Deletes everything created on the cluster including all knative and istio components.
@@ -62,26 +62,24 @@ initialize $@
 
 header "Setting up environment"
 
-# Fail fast during setup.
-set -o errexit
-set -o pipefail
-
-install_knative_serving
-publish_test_images
-
-# Handle test failures ourselves, so we can dump useful info.
+# Handle failures ourselves, so we can dump useful info.
 set +o errexit
 set +o pipefail
 
-# Run the tests
+install_knative_serving || fail_test "Knative Serving installation failed"
+publish_test_images || fail_test "one or more test images weren't published"
 
+# Run the tests
 header "Running tests"
-kubectl create namespace serving-tests
-options=""
-(( EMIT_METRICS )) && options="-emitmetrics"
-report_go_test \
-  -v -tags=e2e -count=1 -timeout=20m \
-  ./test/conformance ./test/e2e \
-  ${options} || fail_test
+
+failed=0
+# Run conformance tests, but don't exit if it fails.
+go_test_e2e -timeout=10m ./test/conformance || failed=1
+
+# So that we can also identify failing E2E tests.
+go_test_e2e -timeout=15m ./test/e2e || failed=1
+
+# Require that both set of tests succeeded.
+(( failed )) && fail_test
 
 success

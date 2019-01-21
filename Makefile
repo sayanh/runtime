@@ -20,6 +20,14 @@ run: generate fmt vet
 install:
 	kubectl apply -f config/crds
 
+# CreateResource creates a resource in the cluster
+create-resource:
+	kubectl apply -f config/samples
+
+# DeleteResource creates a resource in the cluster
+delete-resource:
+	kubectl delete -f config/samples
+
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
 # deploy: manifests
 # 	kubectl apply -f config/crds
