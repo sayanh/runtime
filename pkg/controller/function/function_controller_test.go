@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	servingv1alpha1 "github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	runtimev1alpha1 "github.com/kyma-incubator/runtime/pkg/apis/runtime/v1alpha1"
 	"github.com/onsi/gomega"
 	"golang.org/x/net/context"
@@ -74,9 +75,14 @@ func TestReconcile(t *testing.T) {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"},
 	}
+
+	service := &servingv1alpha1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"},
+	}
 	g.Eventually(func() error { return c.Get(context.TODO(), depKey, cm) }, timeout).
 		Should(gomega.Succeed())
-
+	g.Eventually(func() error { return c.Get(context.TODO(), depKey, service) }, timeout).
+		Should(gomega.Succeed())
 	// Delete the Deployment and expect Reconcile to be called for Deployment deletion
 	g.Expect(c.Delete(context.TODO(), cm)).NotTo(gomega.HaveOccurred())
 	g.Eventually(requests, timeout).Should(gomega.Receive(gomega.Equal(expectedRequest)))

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 
 	buildv1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	servingv1alpha1 "github.com/knative/serving/pkg/apis/serving/v1alpha1"
@@ -96,6 +97,10 @@ type ReconcileFunction struct {
 // +kubebuilder:rbac:groups=runtime.kyma-project.io,resources=functions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=runtime.kyma-project.io,resources=functions/status,verbs=get;update;patch
 func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Result, error) {
+	// TODO make all these configurable
+	// 1. programming language
+	// 2. configmap for secrets
+
 	// Fetch the Function instance
 	fn := &runtimev1alpha1.Function{}
 	err := r.Get(context.TODO(), request.NamespacedName, fn)
@@ -111,7 +116,11 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 	data := make(map[string]string)
 	data["handler"] = "handler.main"
 	data["handler.js"] = fn.Spec.Function
-	data["package.json"] = fn.Spec.Deps
+	if len(strings.Trim(fn.Spec.Deps, " ")) == 0 {
+		data["package.json"] = "{}"
+	} else {
+		data["package.json"] = fn.Spec.Deps
+	}
 
 	// Managing a ConfigMap
 	deployCm := &corev1.ConfigMap{
@@ -128,7 +137,7 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 
 	foundCm := &corev1.ConfigMap{}
 	err = r.Get(context.TODO(), types.NamespacedName{Name: deployCm.Name, Namespace: deployCm.Namespace}, foundCm)
-
+	// TODO: foundCm is empty and error is nil, why??
 	if err != nil && errors.IsNotFound(err) {
 		log.Info("Creating ConfigMap", "namespace", deployCm.Namespace, "name", deployCm.Name)
 		err = r.Create(context.TODO(), deployCm)
@@ -136,10 +145,6 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 			return reconcile.Result{}, err
 		}
 	} else if err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if err := controllerutil.SetControllerReference(fn, deployCm, r.scheme); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -154,6 +159,7 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 
 	// Managing a resource of type Service.serving.knative.dev
 
+	// TODO: Make this configurable
 	dockerHubAccount := "shazra"
 	dockerRegistry := ""
 	randomStr := uuid.NewRandom().String()
@@ -163,17 +169,16 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 	} else {
 		imageName = fmt.Sprintf("%s/%s-%s", dockerRegistry, fn.Name, randomStr)
 	}
-
 	deployService := &servingv1alpha1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:    fn.Labels,
 			Namespace: fn.Namespace,
 			Name:      fn.Name,
 		},
-		Spec: getServiceSpec(imageName),
+		Spec: getServiceSpec(imageName, *fn),
 	}
 
-	if err := controllerutil.SetControllerReference(fn, deployCm, r.scheme); err != nil {
+	if err := controllerutil.SetControllerReference(fn, deployService, r.scheme); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -190,10 +195,6 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 		return reconcile.Result{}, err
 	}
 
-	if err := controllerutil.SetControllerReference(fn, deployService, r.scheme); err != nil {
-		return reconcile.Result{}, err
-	}
-
 	if !reflect.DeepEqual(deployService.Spec, deployService.Spec) {
 		foundService.Spec = deployService.Spec
 		log.Info("Updating Service", "namespace", deployService.Namespace, "name", deployService.Name)
@@ -203,17 +204,13 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 		}
 	}
 
-	// TODO make all these configurable
-	// 1. programming language
-	// 2. configmap for secrets
-
 	return reconcile.Result{}, nil
 
 }
 
-func getServiceSpec(imageName string) servingv1alpha1.ServiceSpec {
+func getServiceSpec(imageName string, fn runtimev1alpha1.Function) servingv1alpha1.ServiceSpec {
 	defaultMode := int32(420)
-	buildContainer := getBuildContainer(imageName)
+	buildContainer := getBuildContainer(imageName, fn)
 	volumes := []corev1.Volume{
 		{
 			Name: "dockerfile-vol",
@@ -227,17 +224,18 @@ func getServiceSpec(imageName string) servingv1alpha1.ServiceSpec {
 			},
 		},
 		{
-			Name: "deps-vol",
+			Name: "func-vol",
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					DefaultMode: &defaultMode,
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "deps-vol",
+						Name: fn.Name,
 					},
 				},
 			},
 		},
 	}
+
 	// TODO: Make it constant for nodejs8/nodejs6
 	envVarsForRevision := []corev1.EnvVar{
 		{
@@ -275,7 +273,7 @@ func getServiceSpec(imageName string) servingv1alpha1.ServiceSpec {
 			Configuration: servingv1alpha1.ConfigurationSpec{
 				Build: &servingv1alpha1.RawExtension{
 					BuildSpec: &buildv1alpha1.BuildSpec{
-						ServiceAccountName: "build-bot",
+						ServiceAccountName: "build-bot", // TODO: make it configurable
 						Steps: []corev1.Container{
 							*buildContainer,
 						},
@@ -295,23 +293,28 @@ func getServiceSpec(imageName string) servingv1alpha1.ServiceSpec {
 	}
 }
 
-func getBuildContainer(imageName string) *corev1.Container {
+func getBuildContainer(imageName string, fn runtimev1alpha1.Function) *corev1.Container {
 	destination := fmt.Sprintf("--destination=%s", imageName)
 	buildContainer := corev1.Container{
-		Name:    "build-and-push",
-		Image:   "gcr.io/kaniko-project/executor",
-		Command: []string{"--dockerfile=/workspace/Dockerfile", destination},
+		Name:  "build-and-push",
+		Image: "gcr.io/kaniko-project/executor",
+		Args:  []string{"--dockerfile=/workspace/Dockerfile", destination},
 		VolumeMounts: []corev1.VolumeMount{
 			{
-				Name:      "dockerfile-vol",
+				Name:      "dockerfile-vol", //TODO: make it configurable
 				MountPath: "/workspace",
 			},
 			{
-				Name:      "deps-vol",
+				Name:      "func-vol",
 				MountPath: "/src",
 			},
 		},
 	}
 
 	return &buildContainer
+}
+
+type Request struct {
+	// NamespacedName is the name and namespace of the object to reconcile.
+	types.NamespacedName
 }

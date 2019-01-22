@@ -20,6 +20,7 @@ import (
 	"flag"
 	"os"
 
+	servingv1alpha1 "github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	"github.com/kyma-incubator/runtime/pkg/apis"
 	"github.com/kyma-incubator/runtime/pkg/controller"
 	"github.com/kyma-incubator/runtime/pkg/webhook"
@@ -58,6 +59,11 @@ func main() {
 	// Setup Scheme for all resources
 	log.Info("setting up scheme")
 	if err := apis.AddToScheme(mgr.GetScheme()); err != nil {
+		log.Error(err, "unable add APIs to scheme")
+		os.Exit(1)
+	}
+
+	if err := servingv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
 		log.Error(err, "unable add APIs to scheme")
 		os.Exit(1)
 	}
