@@ -22,7 +22,6 @@ import (
 	"reflect"
 	"strings"
 
-	buildv1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	servingv1alpha1 "github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	runtimev1alpha1 "github.com/kyma-incubator/runtime/pkg/apis/runtime/v1alpha1"
 	"github.com/pborman/uuid"
@@ -40,6 +39,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	runtimeUtil "github.com/kyma-incubator/runtime/pkg/utils"
 )
 
 var log = logf.Log.WithName("controller")
@@ -101,9 +102,22 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 	// 1. programming language
 	// 2. configmap for secrets
 
+	//TODO: Change it to environment vars
+	fnConfingName := "fn-config"
+	fnConfigNamespace := "default"
+	fnConfig := &corev1.ConfigMap{}
+	err := r.Get(context.TODO(), types.NamespacedName{Name: fnConfingName, Namespace: fnConfigNamespace}, fnConfig)
+	if err != nil {
+		log.Info("Unable to read Function controller config: %v from Namespace: %v", fnConfingName, fnConfigNamespace)
+		return reconcile.Result{}, err
+	}
+
+	riUtil := runtimeUtil.New(fnConfig)
+	riUtil.ReadConfigMap()
+
 	// Fetch the Function instance
 	fn := &runtimev1alpha1.Function{}
-	err := r.Get(context.TODO(), request.NamespacedName, fn)
+	err = r.Get(context.TODO(), request.NamespacedName, fn)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Object not found, return.  Created objects are automatically garbage collected.
@@ -160,8 +174,8 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 	// Managing a resource of type Service.serving.knative.dev
 
 	// TODO: Make this configurable
-	dockerHubAccount := "shazra"
-	dockerRegistry := ""
+	dockerHubAccount := riUtil.RegistryInfo.DockerAccount
+	dockerRegistry := riUtil.RegistryInfo.DockerRegistry
 	randomStr := uuid.NewRandom().String()
 	imageName := ""
 	if len(dockerRegistry) == 0 {
@@ -175,7 +189,7 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 			Namespace: fn.Namespace,
 			Name:      fn.Name,
 		},
-		Spec: getServiceSpec(imageName, *fn),
+		Spec: runtimeUtil.GetServiceSpec(imageName, *fn, riUtil),
 	}
 
 	if err := controllerutil.SetControllerReference(fn, deployService, r.scheme); err != nil {
@@ -206,112 +220,6 @@ func (r *ReconcileFunction) Reconcile(request reconcile.Request) (reconcile.Resu
 
 	return reconcile.Result{}, nil
 
-}
-
-func getServiceSpec(imageName string, fn runtimev1alpha1.Function) servingv1alpha1.ServiceSpec {
-	defaultMode := int32(420)
-	buildContainer := getBuildContainer(imageName, fn)
-	volumes := []corev1.Volume{
-		{
-			Name: "dockerfile-vol",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					DefaultMode: &defaultMode,
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "dockerfile-vol",
-					},
-				},
-			},
-		},
-		{
-			Name: "func-vol",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					DefaultMode: &defaultMode,
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: fn.Name,
-					},
-				},
-			},
-		},
-	}
-
-	// TODO: Make it constant for nodejs8/nodejs6
-	envVarsForRevision := []corev1.EnvVar{
-		{
-			Name:  "FUNC_HANDLER",
-			Value: "main",
-		},
-		{
-			Name:  "MOD_NAME",
-			Value: "handler",
-		},
-		{
-			Name:  "FUNC_TIMEOUT",
-			Value: "180",
-		},
-		{
-			Name:  "FUNC_RUNTIME",
-			Value: "nodejs8",
-		},
-		{
-			Name:  "FUNC_MEMORY_LIMIT",
-			Value: "128Mi",
-		},
-		{
-			Name:  "FUNC_PORT",
-			Value: "8080",
-		},
-		{
-			Name:  "NODE_PATH",
-			Value: "$(KUBELESS_INSTALL_VOLUME)/node_modules",
-		},
-	}
-
-	return servingv1alpha1.ServiceSpec{
-		RunLatest: &servingv1alpha1.RunLatestType{
-			Configuration: servingv1alpha1.ConfigurationSpec{
-				Build: &servingv1alpha1.RawExtension{
-					BuildSpec: &buildv1alpha1.BuildSpec{
-						ServiceAccountName: "build-bot", // TODO: make it configurable
-						Steps: []corev1.Container{
-							*buildContainer,
-						},
-						Volumes: volumes,
-					},
-				},
-				RevisionTemplate: servingv1alpha1.RevisionTemplateSpec{
-					Spec: servingv1alpha1.RevisionSpec{
-						Container: corev1.Container{
-							Image: imageName,
-							Env:   envVarsForRevision,
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func getBuildContainer(imageName string, fn runtimev1alpha1.Function) *corev1.Container {
-	destination := fmt.Sprintf("--destination=%s", imageName)
-	buildContainer := corev1.Container{
-		Name:  "build-and-push",
-		Image: "gcr.io/kaniko-project/executor",
-		Args:  []string{"--dockerfile=/workspace/Dockerfile", destination},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "dockerfile-vol", //TODO: make it configurable
-				MountPath: "/workspace",
-			},
-			{
-				Name:      "func-vol",
-				MountPath: "/src",
-			},
-		},
-	}
-
-	return &buildContainer
 }
 
 type Request struct {

@@ -64,7 +64,7 @@ func main() {
 	}
 
 	if err := servingv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
-		log.Error(err, "unable add APIs to scheme")
+		log.Error(err, "unable add Serving APIs to scheme")
 		os.Exit(1)
 	}
 
